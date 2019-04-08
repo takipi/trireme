@@ -35,12 +35,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
+import java.sql.Blob;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.util.ArrayList;
+import java.util.List;
 
 import static io.apigee.trireme.core.ArgUtils.*;
 
@@ -51,6 +53,9 @@ public class JdbcConnection
 
     public static final String CLASS_NAME = "_triremeJdbcConnection";
 
+    private final boolean LONG_BUFFER_AS_LONG =
+    		Boolean.parseBoolean(System.getProperty("trireme.jdbc.long.buffer.as.blob"));
+    
     private Connection conn;
     private NodeRuntime runtime;
 
@@ -220,9 +225,12 @@ public class JdbcConnection
                     synchronized (self) {
                         Context cx = Context.enter();
                         PreparedStatement st = self.conn.prepareCall(sql);
+                        
+                        List<Object> cleanups = null;
+                        
                         try {
                             if (params != null) {
-                                self.setParams(params, st, cx);
+                            	cleanups = self.setParams(self.conn, params, st, cx);
                             }
 
                             // Execute the result and retrieve all the rows right here, and return in one big object
@@ -251,6 +259,17 @@ public class JdbcConnection
 
                         } finally {
                             Context.exit();
+                            
+                            if (cleanups != null) {
+                            	for (Object o : cleanups) {
+                            		if (o instanceof Blob) {
+                            			try {
+                            				((Blob)o).free();
+                            			} catch (Exception e) {}
+                            		}
+                            	}
+                            }
+                            
                             st.close();
                         }
                     }
@@ -289,7 +308,7 @@ public class JdbcConnection
                         PreparedStatement st = self.conn.prepareCall(sql);
                         try {
                             if (params != null) {
-                                self.setParams(params, st, cx);
+                                self.setParams(self.conn, params, st, cx);
                             }
 
                             // Execute the result and return an object to retrieve the rows
@@ -342,11 +361,14 @@ public class JdbcConnection
         return cx.newArray(this, jrows);
     }
 
-    private void setParams(Scriptable params, PreparedStatement st, Context cx)
+    @SuppressWarnings("null")
+	private List<Object> setParams(Connection con, Scriptable params, PreparedStatement st, Context cx)
         throws SQLException
     {
+    	List<Object> resp = new ArrayList<Object>();
+    	
         if (!params.has("length", params)) {
-            return;
+            return resp;
         }
 
         int length = ((Number)params.get("length", params)).intValue();
@@ -365,17 +387,36 @@ public class JdbcConnection
 
             } else if (p instanceof Buffer.BufferImpl) {
                 ByteBuffer bb = ((Buffer.BufferImpl)p).getBuffer();
+                
+                boolean useBlob = ((LONG_BUFFER_AS_LONG) && (bb.remaining() >= 4000));
+                Blob blob = null;
+                
+                if (useBlob) {
+                	blob = con.createBlob();
+                	resp.add(blob);
+                }
+                
                 if (bb.hasArray() && (bb.arrayOffset() == 0) && (bb.position() == 0) &&
                     (bb.remaining() == bb.array().length)) {
-                  // We can safely just pass the whole array by reference into SQL
-                  st.setBytes(i + 1, bb.array());
+                	// We can safely just pass the whole array by reference into SQL
+                	if (useBlob) {
+                	    blob.setBytes(1, bb.array());
+                		st.setBlob(i + 1, blob);
+                	} else {
+                		st.setBytes(i + 1, bb.array());
+                	}
                 } else {
-                  // We have to make a copy
-                  byte[] tmp = new byte[bb.remaining()];
-                  bb.get(tmp);
-                  st.setBytes(i + 1, tmp);
+	                // We have to make a copy
+	                byte[] tmp = new byte[bb.remaining()];
+	                bb.get(tmp);
+	              
+	                if (useBlob) {
+	              	    blob.setBytes(1, tmp);
+	              	    st.setBlob(i + 1, blob);
+	                } else {
+	            	    st.setBytes(i + 1, tmp);
+	                }
                 }
-
             } else if (p instanceof Scriptable) {
                 try {
                     // Optimistically think that this is a Date.
@@ -384,11 +425,12 @@ public class JdbcConnection
                 } catch (Exception e) {
                     throw new SQLException("Invalid JavaScript object for parameter " + i + ": " + e);
                 }
-
             } else {
                 throw new SQLException("Invalid type for parameter " + i + ": " + p);
             }
         }
+        
+        return resp;
     }
 
     private void returnError(final Function cb, Object domain, final SQLException se)
